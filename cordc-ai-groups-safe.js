@@ -10,7 +10,11 @@
 //   4. 【本地新增】内网 / 私有地址直连规则也插到最前面
 //      —— 解决 DOMAIN-KEYWORD,hdec,DIRECT 被 MATCH 兜底抢先的问题
 //   5. 【本地新增】内网域名 DNS 纠偏：排除 fake-ip + 指定公司 DNS
-//      —— 解决 yrz.powerchina.cn 被答成 198.18.x.x（真身 10.30.1.91）导致直连也连不上
+//      —— 解决内网域名被答成 198.18.x.x 后，直连时用公网 DoH 换不出真实 IP 的问题
+//   6. 【本地新增】内网域名 hosts 静态映射（yrz / fssc / fssce）
+//      —— 这是最可靠的一层：优先级高于 fake-ip 与所有 nameserver，且不会被客户端重载清掉
+//   7. 【关键修复】DNS 段兜底 config.dns
+//      —— 客户端执行脚本时 config.dns 可能尚不存在，缺兜底会让 5 与 6 的 DNS 部分被静默跳过
 //
 // 用法：设置 -> 高级 -> 脚本 -> 编辑 -> 全选删除 -> 粘贴本文件 -> 保存 -> 重载配置
 // 恢复：删除脚本即可
@@ -21,10 +25,24 @@
 // ============================================================
 const LOCAL_DIRECT = {
   // ★ 内网域名 -> 真实 IP 的静态映射（跨平台最可靠的一项）
-  // 公司内网域名在公网 DNS 上是 NXDOMAIN，只能靠 hosts 查表直接返回。
-  // 换机器 / 换网段时这里的 IP 可能不同，必须用本机 DNS 重新解析一次。
+  //
+  // 【为什么需要】公司内网域名在公网 DNS 上是 NXDOMAIN。代理内核直连时要用
+  //   上游 DNS 把域名换成真实 IP，公网 DoH 换不出来，于是连接失败：
+  //   走 TUN 表现为 ERR_EMPTY_RESPONSE，走 HTTP 代理表现为 502。
+  //   注意：内核返回 198.18.x.x 这种假 IP 本身不致命，致命的是后面换不出真 IP。
+  //
+  // 【优先级】hosts 在内核里是最高的，凌驾于 fake-ip 与所有 nameserver，
+  //   所以写进来就一定生效，也不会被客户端的 DNS 设置覆盖。
+  //
+  // 【换机器怎么办】IP 可能随网段变化，在本机重新解析一次即可（UDP 53 可用）：
+  //   nslookup yrz.powerchina.cn 172.21.3.3
+  //
+  // 【加新域名】只在下面对象里加一行：key 全小写，value 是点分十进制 IPv4。
+  //   数组/对象型字段不会被客户端重载清掉；这也是本脚本比 DNS 设置可靠的原因。
   hosts: {
-    "yrz.powerchina.cn": "10.30.1.91"
+    "yrz.powerchina.cn":   "10.30.1.91",     // 实测 302，内网可达
+    "fssc.powerchina.cn":  "10.158.100.111", // 只监听 33052，443/80 均不通
+    "fssce.powerchina.cn": "10.19.18.12"     // 只监听 9081，必须用 https
   },
 
   // 关键字直连：只要域名里出现这些词，就走 DIRECT
@@ -241,8 +259,17 @@ function applyCordc(config) {
     return !localSet[r];
   });
 
+  // ---------- 0.45 DNS 段兜底（关键修复 2026-11-16）----------
+  // CordC 执行本脚本时，config.dns 可能尚不存在（订阅无 dns 段，patchClashConfig 稍后才合并）。
+  // 缺兜底会导致下面两段 DNS 注入被 if (config.dns) 静默跳过：
+  // 规则全生效、但 fake-ip-filter / nameserver-policy 一条都没进运行配置，
+  // 内网域名仍被答成 198.18.x.x，DIRECT 建连时用公网 DoH 解不出 10.x -> HTTP 502。
+  if (!config.dns || typeof config.dns !== "object") {
+    config.dns = {};
+  }
+
   // fake-ip 排除：防止内网域名被劫持成 198.18.x.x（走 IP 规则时会导致直连失效）
-  if (LOCAL_DIRECT.excludeFromFakeIp && config.dns) {
+  if (LOCAL_DIRECT.excludeFromFakeIp) {
     const filter = Array.isArray(config.dns["fake-ip-filter"]) ? config.dns["fake-ip-filter"] : [];
     LOCAL_DIRECT.domains.forEach(function (d) {
       const p = "+." + String(d).toLowerCase();
